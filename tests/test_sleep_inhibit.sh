@@ -77,9 +77,13 @@ wait $REQ
 [ "$SEEN" = "1" ] && run_test "assertion held during generation" PASS "" \
                   || run_test "assertion held during generation" FAIL "never held while a request was in flight"
 
-sleep 2
+# Held through the 3 s idle grace (IDLE_GRACE_MS), released after it.
+sleep 1
+[ "$(held)" = "1" ] && run_test "assertion kept through the idle grace" PASS "" \
+                    || run_test "assertion kept through the idle grace" FAIL "released within 1s of the last token"
+sleep 4
 [ "$(held)" = "0" ] && run_test "assertion released once the server goes idle" PASS "" \
-                    || run_test "assertion released once the server goes idle" FAIL "still held 2s after the last token"
+                    || run_test "assertion released once the server goes idle" FAIL "still held 5s after the last token"
 stop_server
 
 # Log order avoids racing the short startup load.

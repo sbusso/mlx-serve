@@ -47,6 +47,14 @@ pub fn isEnabled() bool {
     return enabled;
 }
 
+/// How long the inference thread keeps the assertion once idle, so a client that
+/// sends a request every few seconds does not recreate it for each one.
+pub const IDLE_GRACE_MS: i64 = 3000;
+
+pub fn isHeld() bool {
+    return held;
+}
+
 /// Inference-thread only.
 pub fn setActive(want: bool) void {
     if (comptime !is_macos) return;

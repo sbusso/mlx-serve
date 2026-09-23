@@ -4591,9 +4591,20 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
+            // No later tick runs while parked: keep the assertion through the idle
+            // grace, release it, then park untimed.
+            const grace = (std.Io.Timeout{ .duration = .{
+                .raw = .fromMilliseconds(sleep_inhibit.IDLE_GRACE_MS),
+                .clock = .awake,
+            } }).toDeadline(sch.io);
             while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
-                // No later tick runs while parked, so release here.
-                sleep_inhibit.setActive(false);
+                if (sleep_inhibit.isHeld()) {
+                    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, grace) catch |err| switch (err) {
+                        error.Timeout => sleep_inhibit.setActive(false),
+                        error.Canceled => {},
+                    };
+                    continue;
+                }
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
@@ -7325,13 +7336,14 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {
-    // Pin release < park < acquire and startup acquire < load.
+    // Pin timed grace wait < release < untimed park < acquire, and startup acquire < load.
     const source = @embedFile("scheduler.zig");
     const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
     const body = source[start..end];
-    const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
-    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+    const timed = std.mem.indexOf(u8, body, "sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, grace)") orelse return error.MissingGraceWait;
+    const drop = std.mem.indexOfPos(u8, body, timed, "sleep_inhibit.setActive(false)") orelse return error.MissingSleepRelease;
+    const park = std.mem.indexOfPos(u8, body, drop, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
     const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
     try testing.expect(drop < park);
     try testing.expect(park < hold);
