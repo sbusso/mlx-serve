@@ -409,6 +409,8 @@ const Entry = struct {
     /// Has the slot's append donated these buffers in place (`donateCheckout`)? Until then the
     /// entry's handles are live and a slot that ends hands the entry back; only a donated checkout is dropped.
     checkout_donated: bool = false,
+    /// A module state larger than the byte budget, resident only until the SSD tier has it (`dropWrittenOverBudget`).
+    over_budget: bool = false,
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -2054,7 +2056,10 @@ pub const HotPrefixCache = struct {
         if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return .declined;
         if (info.n != ids.len or info.prefix_key != prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return .declined;
         const aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot);
-        if (self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes) {
+        // A state over the budget is kept whole or lost: with an SSD tier to write it to, it is held past the budget
+        // until the writer has it, so the next turn restores instead of prefilling the conversation cold.
+        const over = self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes;
+        if (over and (tail_from > 0 or !self.moduleExportable(ids.len))) {
             self.logModuleDecline(ids.len, aux_bytes, "larger than the budget, raise --prefix-cache-mem");
             return .declined;
         }
@@ -2071,7 +2076,8 @@ pub const HotPrefixCache = struct {
         const room = blk: {
             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
             defer self.incoming_tip = null;
-            break :blk self.makeModuleRoom(aux_bytes, cache_key, tail_from > 0);
+            // An over-budget state takes the whole budget: everything else goes first, so only it overshoots.
+            break :blk self.makeModuleRoom(if (over) self.max_kv_bytes else aux_bytes, cache_key, tail_from > 0);
         };
         if (!room) {
             self.logModuleDecline(ids.len, aux_bytes, if (tail_from > 0) "a decode-end checkpoint takes no prompt boundary's room" else "no entry could be evicted for it");
@@ -2093,9 +2099,41 @@ pub const HotPrefixCache = struct {
         });
         retained = true;
         self.current_kv_bytes += aux_bytes;
-        if (tail_from == 0) self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
+        const last = self.entries.items.len - 1;
+        if (tail_from == 0) self.registerModuleEntry(&self.entries.items[last]);
+        if (over) {
+            // Held for the writer only: a state the tier did not take would overshoot for good.
+            if (!self.entries.items[last].disk_dirty) {
+                self.evictAt(last, "over the byte budget and the SSD tier did not take it");
+                return .declined;
+            }
+            self.entries.items[last].over_budget = true;
+            log.info("  [hot-cache] module snapshot ({d} tokens, {d:.2} MB) is over the {d:.2} MB budget: held until the SSD tier has it\n", .{
+                ids.len,
+                @as(f64, @floatFromInt(aux_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
+            });
+        }
         self.logResident();
         return .{ .ok = ids.len };
+    }
+
+    /// Whether the SSD tier writes a module state of `tokens` tokens.
+    fn moduleExportable(self: *const HotPrefixCache, tokens: usize) bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        return d.module_context != null and tokens >= kv_disk_cache.MIN_PERSIST_TOKENS;
+    }
+
+    /// An entry held past the byte budget leaves RAM once its export is on the SSD tier, which serves it from then on.
+    fn dropWrittenOverBudget(self: *HotPrefixCache, d: *const kv_disk_cache.DiskTier) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = &self.entries.items[i];
+            const id = if (e.over_budget and e.checked_out_by == null) (if (e.module) |m| m.disk_id else null) else null;
+            if (id != null and d.moduleState(id.?) == .committed) {
+                self.evictAt(i, "over the byte budget, now on the SSD tier");
+            } else i += 1;
+        }
     }
 
     /// A module snapshot is kept whole or not at all, so the next turn of its conversation prefills cold.
@@ -3340,6 +3378,7 @@ pub const HotPrefixCache = struct {
         d.pollModuleWrites();
         d.cleanupModules();
         self.syncModuleLosses();
+        self.dropWrittenOverBudget(d);
         if (!self.diskOwed()) {
             self.disk_dirty = false;
             return null;
@@ -12232,6 +12271,52 @@ test "a turn's commit drops the unwritten export of the state it supersedes" {
     try testing.expect(hc.pending_disk == null and hc.finishing_disk == null);
     try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
+
+test "a module snapshot over the byte budget is held for the SSD tier: served from RAM until it is written, from disk after" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    hc.max_kv_bytes = 3 << 20;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var small = ModuleDiskTest.snap(&fake, ids[0..512]);
+    small.bytes = 1 << 20;
+    _ = try small.put(&hc, binding, &.{});
+
+    // Over the budget: it takes the cache whole, is billed (admission sees it) and the next turn restores it.
+    var huge = ModuleDiskTest.snap(&fake, &ids);
+    huge.bytes = 4 << 20;
+    try testing.expectEqual(CommitStatus{ .ok = 513 }, try huge.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(@as(u64, 4 << 20), hc.residentBytes());
+    var longer: [520]u32 = undefined;
+    for (&longer, 0..) |*id, i| id.* = 7 + @as(u32, @intCast(i));
+    const ram = hc.findModuleMatch(binding, &longer, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.ram, ram.source);
+    try testing.expectEqual(@as(usize, 513), ram.n);
+
+    // Once the writer has it the RAM copy goes, and the SSD tier serves the same prefix.
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    const disk = hc.findModuleMatch(binding, &longer, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, disk.source);
+    try testing.expectEqual(@as(usize, 513), disk.n);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+
+    // Under the tier's persist floor there is nowhere to hold it for: declined, as without a tier.
+    var stub = ModuleDiskTest.snap(&fake, ids[0..8]);
+    stub.bytes = 4 << 20;
+    try testing.expectEqual(@as(CommitStatus, .declined), try stub.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
 }
 
 test "under-floor module commits remain RAM-only" {
