@@ -7,12 +7,12 @@ plus the rules for running them. What a script checks, what it needs and how to 
 
 - **Binary**: scripts run `./zig-out/bin/mlx-serve` (most take `BINARY` or `MLX_SERVE_BIN`). Build
   `zig build -Doptimize=ReleaseFast` first; `zig build test` does not refresh it, and Debug is 2-4x slower.
-- **Boot and wait through `tests/lib/server.sh`** (`srv_wait_health`, `srv_wait_log`, `srv_stop`; Python twin
-  `tests/lib/server.py`, `from lib.server import wait_health`). Readiness is the STATUS: `/health` answers 503
-  `loading` while a model loads, so a bare socket or `curl -s` check lies.
-- **Kill only the server you started** (`srv_stop "$PID"` or `pkill -f "mlx-serve.*--port $PORT"`), never by name or
-  binary path: that kills the app's server and other sessions' runs. The app's server is 11234 (11240/11250 are
-  taken too); every script has its own default port, pass one when running several.
+- **Boot and wait through `tests/lib/server.sh`** (`srv_wait_health`, `srv_wait_log`, `srv_stop`, `srv_preclean`;
+  Python twin `tests/lib/server.py`, `from lib.server import wait_health`). Readiness is the STATUS: `/health` answers
+  503 `loading` while a model loads, so a bare socket or `curl -s` check lies.
+- **Kill only the server you started**: `srv_stop "$PID"`, or `srv_preclean "$PORT"` for a leftover (the mlx-serve
+  listening on the port, started from this checkout). Never `pkill` by name, flags or path: a `--port $PORT` pattern
+  takes a production server on that port. The app's is 11234 (11240/11250 too); pass a port when running several.
 - **Scratch HOME** for anything that lists, picks or configures models: a real `~/.mlx-serve/model-settings.json`
   attaches drafters and pins KV schemes, `providers.json` adds `@provider` rows. A test asserting one spec mode passes
   `--no-drafter` / `--no-mtp` for the arms it does not test.

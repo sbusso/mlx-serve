@@ -409,7 +409,7 @@ Teaches any agent to wire user code to our HTTP APIs (chat, embeddings, media, d
 ### Reproducing
 - Tool calling: curl with `stream: false` first, then `stream: true`
 - Jinja offline: `pip3 install jinja2`, render `chat_template.jinja` with dumped request
-- KV cache: `pkill -f mlx-serve` between tests — one bad request can poison the cache
+- KV cache: restart your own server between tests (by pid, never `pkill -f mlx-serve`) — one bad request can poison the cache
 
 ### Embedded engines (`lib/<engine>/`)
 
