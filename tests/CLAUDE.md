@@ -191,7 +191,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
   laguna, latent_rgb_factors, laya (+ numeric), lfm2_vision, lilicorr, ltx (audio, audio encoder, diffvae, upsampler, vae
   encoder), mageflow (dit, e2e, edit e2e, te, te edit, vae, vae encoder, vit), mimo_v2, minicpmv4_7_vision, minimax_h3
   (+ layout, vision, vision tower, vae encoder, audio encoder), moss_image, muse_vision, music3, nemotron_diarization,
-  pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
+  pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen3_tts (voice), qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
   stable_audio, tokenizer_parity, trellis2, yue2
 - `build_qwen_preprocess_fixture.py`, `build_qwen_vision_fixture.py` Qwen3-VL fixtures · `dsv4_mlx_ref.py` MLX reference
 - `dsv4_template_ab.py`, `dsv41_template_ab.py` byte-exact template A/B · `dsv4_task_compare.py` **R** native vs GGUF tasks
