@@ -32,6 +32,10 @@ Weights, quant, loading:
 - **A GGUF weight is `.gguf` ONLY when its scales are the bool TYPE SENTINEL**: affine-coded types load as MLX affine
   triples and floats dense, so a reader keying on "GGUF set + scales" sent affine codes to `gather_qmm` as `gguf`
   (`ggufProj`, llama `modeOf`). Raw ggml bytes only through `kernels.infoOf`; such a weight has no biases.
+- **A claim checks what the model reads IN PLACE too** (`gguf.Arch.readsInPlace`): a tensor the loader skips is not
+  type-checked by `serves`, so a DeepSeek-V4.1 set with a Q5_K Engram table passed the claim though its reader
+  refuses it at load (`EngramTableGeometry`); a decline hands the set to llama.cpp. Guard: `unsupportedReason: a
+  DeepSeek-V4.1 set's Q6_K head ...`.
 - **Dense checkpoints**: scales absence PER-TENSOR (`getLayerScaleOpt`); dense contracted weights owe `maybeTransposeForBf16` — never depthwise conv or SSM state.
 - **ModelOpt's NVFP4 `weight_scale_2` is amax / (448 x 6); MLX's nvfp4 `global_scale` is the amax** (`modelopt_pack.dequantDense`): passed through raw, every weight shrank 2688x and the vision tower saw a blank image.
 - **A pack runs in its reference's numerics** (`actDtype`, `LoadOpts.keep_f16`; Bonsai 2 f16 + f32 GDN state; qwen4 f32 GDN state + gate, `MLX_SERVE_GDN_STATE_F32=0` = bf16); constants take the activation dtype. Guard: `test_hadamard_fidelity.sh`.

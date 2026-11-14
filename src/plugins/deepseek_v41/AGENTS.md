@@ -32,6 +32,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
+- Outside the routed experts a GGUF tensor must be in an MLX layout (the forward has no raw-block read there): Q6_K
+  is requantized to 8-bit g32 at load (`gguf.Arch.loadsMlx`); the in-set Engram table is read as IQ4_NL only and
+  another type is declined at the claim (`Arch.readsInPlace`), never at the load.
 
 ## Facts the table declares
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
