@@ -25,6 +25,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kernels = @import("../../mlx/kernels.zig");
+const device = @import("../../mlx/device.zig");
 
 const Arr = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -37,11 +38,15 @@ const Tile = struct { no: c_int, sg: c_int };
 
 var enabled_cache: ?bool = null;
 
-/// Default on: only `MLX_SERVE_MING_FUSED=0` turns the kernels off.
+/// The first GPU generation the kernels are verified on (M4). An M3 Ultra (g15) gave unintelligible bf16 speech on
+/// them (#1121); the kernel contract still runs there, so the cause can be found and the floor lowered.
+const first_gen = 16;
+
+/// On from `first_gen` unless `MLX_SERVE_MING_FUSED=0`.
 pub fn enabled() bool {
     if (enabled_cache) |v| return v;
     const raw = env.span(.MLX_SERVE_MING_FUSED);
-    const v = raw == null or !std.mem.startsWith(u8, raw.?, "0");
+    const v = device.deviceGeneration().gen >= first_gen and (raw == null or !std.mem.startsWith(u8, raw.?, "0"));
     enabled_cache = v;
     return v;
 }
@@ -272,6 +277,13 @@ pub fn lmLayer(l: *const LmLayer, x: Arr, pos: Arr, kc: Arr, vc: Arr, log2_theta
 
 // ── tests ──
 
-test "ming_tts fused: on unless the switch says 0" {
+test "ming_tts fused: on from first_gen unless the switch says 0" {
+    defer device.device_gen_override = null;
+    defer enabled_cache = null;
+    device.device_gen_override = .{ .gen = 15, .phone = false }; // M3
+    enabled_cache = null;
+    try std.testing.expect(!enabled());
+    device.device_gen_override = .{ .gen = first_gen, .phone = false };
+    enabled_cache = null;
     try std.testing.expect(env.span(.MLX_SERVE_MING_FUSED) != null or enabled());
 }
