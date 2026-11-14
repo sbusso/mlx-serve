@@ -108,7 +108,7 @@ fn is(a: A, dt: mlx.mlx_dtype, shape: []const usize) bool {
 
 /// A dense bf16 `[rows, D]` linear's rows, or null.
 fn bf16Rows(l: *const v41.Lin, d: usize) ?usize {
-    if (l.s.ctx != null or mlx.mlx_array_dtype(l.w) != .bfloat16) return null;
+    if (l.ext != null or l.s.ctx != null or mlx.mlx_array_dtype(l.w) != .bfloat16) return null;
     const sh = dims(l.w);
     if (sh.len != 2 or sh[1] != d or sh[0] <= 0 or @mod(sh[0], rt) != 0) return null;
     return @intCast(sh[0]);
@@ -1096,7 +1096,7 @@ fn layerBytes(p: Plan) usize {
 }
 
 test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces (DSV41_DEC_UBENCH)" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const k = try Kernels.build();
     defer k.deinit();

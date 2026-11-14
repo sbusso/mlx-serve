@@ -80,6 +80,12 @@ const ConfigPeek = union(enum) {
     missing_or_unparseable,
 };
 
+/// A `model_type` of [A-Za-z0-9_.-] only.
+fn plainModelType(s: []const u8) bool {
+    for (s) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-')) return false;
+    return true;
+}
+
 /// Peek at a candidate's `config.json`: classify by `model_type` and
 /// `quantization.mode`. Discovery uses this to filter out:
 ///   - unsupported archs (e.g. deepseek_v4, which crashes the tokenizer)
@@ -106,6 +112,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer parsed.deinit();
     if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
+    const declared: []const u8 = if (root.get("model_type")) |v| (if (v == .string) v.string else "") else "";
+    // `/v1/models` writes the type unescaped.
+    if (!plainModelType(declared)) return .missing_or_unparseable;
+    // An engine plugin's model is its own: no MLX check applies.
+    if (outside_plugins.engineFor(entry_name) != null) return .{ .supported = allocator.dupe(u8, declared) catch return .missing_or_unparseable };
     // The DFlash contract outranks model_type: v1 assistants at least carry a
     // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
     // from its trunk family without this probe (one predicate, shared with
@@ -913,8 +924,8 @@ fn applyServedStub(meta: *StubMeta, st: mlx_engine.PluginStub) void {
 
 /// Read `StubMeta` for the model directory at `abs_path` (config.json + a
 /// chat-template-presence check). Best-effort: any I/O / parse failure yields
-/// `.found=false`. Called per unloaded entry from `/v1/models` — cheap (small
-/// JSON files) and that endpoint isn't hot.
+/// `.found=false`. `/v1/models` asks through `stub_cache.zig`, which keeps the
+/// answer while the dir's files stand.
 pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) StubMeta {
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
@@ -1840,8 +1851,8 @@ test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
     try testing.expect(isSupportedModelType("glm5_next"));
     try testing.expect(isSupportedModelType("glm5_next_text"));
     try testing.expect(isSupportedModelType("deepseek_v41"));
-    try testing.expect(isSupportedModelType("glm_moe_dsa"));
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("glm_moe_dsa"));
+    // GLM-5.3 left the tree with its streamed pack: an outside plugin can claim it.
+    try testing.expect(!isSupportedModelType("glm_moe_dsa"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
@@ -1897,6 +1908,15 @@ test "a Qwen3-ForcedAligner pack is discovered as the aligner, never as an ASR" 
     defer if (peek == .supported) a.free(peek.supported);
     try testing.expect(peek == .supported);
     try testing.expectEqualStrings("qwen3_forced_aligner", peek.supported);
+}
+
+test "peekConfig: a model_type that is not a plain identifier is no model" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "odd");
+    try tmp.dir.writeFile(io, .{ .sub_path = "odd/config.json", .data = "{\"model_type\":\"llama\\\",\\\"x\"}" });
+    try testing.expect(peekConfig(io, testing.allocator, tmp.dir, "odd") == .missing_or_unparseable);
 }
 
 test "parseStubMeta reads the native Nemotron omni language config" {

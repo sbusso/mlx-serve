@@ -18,17 +18,17 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` 0.32.5 pre-release, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF), libllama (`lib/llama`, generic GGUF), the Neural Engine runtime (`lib/ane`). Absorbed in-tree: sushi's EXL3 + STQ (`src/sdk/quant/exl3/sushi/`, module `sushi_exl3`, `zig build exl3-test`) and davidtai's mlx-stream (`src/mlx_stream.zig`).
+Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` 0.32.5 pre-release, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF), libllama (`lib/llama`, generic GGUF), the Neural Engine runtime (`lib/ane`). Absorbed in-tree: sushi's EXL3 + STQ (`src/sdk/quant/exl3/sushi/`, module `sushi_exl3`, `zig build exl3-test`) and davidtai's mlx-stream expert streamer (`src/sdk/weights/streamed/`, shipped in the kit as `kit.streamed`).
 
 ## Layout (`src/`)
 
-Two seams: the ENGINE interface (`abi/engine.zig`, host ↔ an engine, per request) and the PLUGIN tables
-(`abi/plugin.zig` model, `abi/media.zig` media, `abi/quant.zig` quant; per load and per forward, never per layer).
+Two seams: the ENGINE interface (`abi/engine.zig`, host ↔ an engine, per request; an outside engine plugin is one) and
+the PLUGIN tables (`abi/plugin.zig` model, `abi/media.zig` media, `abi/quant.zig` quant; per load and per forward, never per layer).
 
 | Area | Role |
 |---|---|
 | `main.zig`, `env.zig` | Entry, CLI flags + subcommands; every environment variable registered in `env.zig` (kind, owner, since) |
-| `exe.zig`, `host_unit.zig`, `engine_unit.zig`, `modules_unit.zig` | `-Dunits` roots: the host, the MLX engine, the module archs it calls by symbol (`engines/mlx/modules/call.zig`: DSpark, the cluster worker, EXL3 experts, qwen4's MTP head; the stream glue) and each plugin group (`unit_<g>.zig`, generated) as their own objects, each under 3 GB of compiler memory (`scripts/unit_memory.py`); `shared_all.zig` lists every `Shared` the host owns |
+| `exe.zig`, `host_unit.zig`, `engine_unit.zig`, `modules_unit.zig` | `-Dunits` roots: the host, the MLX engine, the module archs it calls by symbol (`engines/mlx/modules/call.zig`: DSpark, the cluster worker, EXL3 experts, qwen4's MTP head) and each plugin group (`unit_<g>.zig`, generated) as their own objects, each under 3 GB of compiler memory (`scripts/unit_memory.py`); `shared_all.zig` lists every `Shared` the host owns |
 | `host/` | Everything model-agnostic: `http/` (router, conn, SSE, WS, multipart, auth), `api/` (OpenAI, Anthropic, Responses, Ollama, embeddings, `/v1/models`, providers, transcription), `chat/` (templates, `tools/` one file per dialect, `reasoning/`, stops, format corpus + traffic replay), `registry/` (discovery, modality map, model settings, load progress), `gpu_thread/` (what connection threads hand the GPU thread: the `Scheduler`'s queues, load/submit/media/vision/embed requests), `engines/` (`mlx.zig` = the ONE way into the MLX engine, a table of calls; `stream.zig` = a request's output every engine fills through `Sink.event`; `served.zig` = the other engines), `media/` (request media), `media_jobs/` (media-gen jobs, previews), `lan/`, `launch/`, `cli/`, `metrics/`, `plugins/` (outside dylibs, `mlx-serve plugin new\|check\|install`), `sandbox/` |
 | `abi/` | Extern tables only, no globals: engine, model plugin, media, quant, `Host`, dylib manifest; `contract_test.zig` + `exactness_test.zig` run every engine |
 | `engines/mlx/` | Our engine, reached by the host only through `api.zig` (the table `host/engines/mlx.zig` declares): `runtime/` (the inference thread: sole MLX caller, loads, media jobs, offloaded engines), `scheduler.zig` + `step.zig` (slots, admission in `admission/`, batching in `batching/`/`batched/`), `loop_stop.zig`, `generate/`, `sampling/`, `grammar/`, `spec/` (PLD, drafter, DFlash/DSpark, MTP rounds, round cost), `kv/`, `cache/` (prefix cache, SSD tier `cache/ssd/`), `ssm/`, `cluster/` (Thunderbolt RDMA), `plugin/` (the DRIVER that serves a plugin table, its proofs and tapes), `load/` + `forward/` + `transformer.zig` (the legacy `Transformer` the unflipped archs still run) |
@@ -37,7 +37,6 @@ Two seams: the ENGINE interface (`abi/engine.zig`, host ↔ an engine, per reque
 | `plugins/<name>/` | One model family or media backend each: `plugin.zig` (the table), `config.zig` (MLX-free claim + parse + bill), its own blocks, `kernels/`, `fixtures/`, proofs, and its `AGENTS.md` (its rules and quirks: read it before touching the model). `_template*` = the barebones plugins, `_example*` = the kit's |
 | `mlx/` | `ffi.zig` (mlx-c), `ops.zig` (the op layer: a `Graph` owns what it makes), `scope.zig`, `kernels.zig` (the kernel loader), `state.zig` |
 | `kernels/<area>/` | Metal/CUDA kernels two or more plugins use (one model's own: `plugins/<name>/kernels/`); every file listed with its sha256 in `kernels/digests.txt` |
-| `mlx_stream.zig` | The absorbed mlx-stream module: GLM-5.3 (`plugins/glm_moe_dsa/`, its only implementation, still on the engine's `modules/stream_glue.zig`), MiMo's expert streamer (`sdk/weights/streamed/mimo/`), GLM-5.3-Flash's EXL3 lane (`sdk/weights/streamed/glm5n/`), EXL3 kernels in `sdk/quant/exl3/stream/`; `zig build mlx-stream-test` |
 | `kit.zig`, `kit_header.zig`, `plugin_host.zig` | The plugin kit's module, its generated C header, and the host surface a plugin's own test build imports |
 | `testing/fake_engine.zig`, `tests.zig`, `preview_tests.zig`, `ios_lib.zig` | Test roots, the no-model engine, the iOS entry |
 | `html/index.html` | The console, BUILT from `app-web/` (never hand-edited) |
@@ -79,9 +78,12 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 **A test that dispatches a Metal kernel, or runs a Neural Engine program, skips on a virtual GPU** (a VM has no ANE either). CI's `macos-26` runner reports the device `air64_v27`, caps threadgroups at 384-896 and kills command buffers with `Insufficient Memory`, so an unguarded kernel test fails or exits 255 there and turns the `zig` job red. Start it with `if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;` (`mlx.virtualGpu()` alone when it has no other skip). A bulk patch must scan the whole test body for the guard, not the next few lines. PR runs omit `-Dslow-tests` unless the diff touches the replay's paths and pushes to main add it, so a green PR can still hide a slow-test failure on main.
 
+**Green CI does not run a kernel or the proofs of a plugin that owns one** (#1027: they skip on the runner). Before merging a change to a kernel, a quant path or a model plugin, run its tests on a real Mac (`zig build test -Dtest-filter=<plugin>`, or the full suite): a parity test merged green and failed on the first M5 run.
+
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
+- **Benchmark with `--warmup-full`** (bench.sh passes it): without it a build's first pass on a model carries its one-time Metal kernel compiles and reads like a regression.
 - Methodology: `/bench` (llmprobe measures; bench.sh drives mlx-serve, `--url` probes another engine). Only diff same-methodology cells; spec cells are variance: same-session ratios only, name the engine in every win, an A/B arm is proven by ENGAGEMENT lines. Record = `benchmarks.md` + `~/claude-tmp/bench-<tag>/`.
 
 ## Conventions
@@ -135,16 +137,16 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `lfm3`, `lfm3_vl`, `lfm3_audio`, `lfm3_omni` | `lfm3` | Gated conv + full/sliding gated attention, sandwich norms, zero-tail partial RoPE; VL + speech towers via `MediaHooks`; speech OUT via `SpeechHooks` (OpenAI `modalities`, `/v1/audio/speech`) |
 | `laguna`, `kolibri1`, `flint` | same | Sliding + NoPE attention arms with sigmoid MoE and an UNGATED shared expert |
 | `gpt_oss`, `spark2_5`, `k2_horizon`, `muse_glimmer(_text)` | same | Sink attention / sliding dense / grouped-RMS Llama / Muse VL (Harmony channels, ATEM tools) |
-| `mimo_v2`, `mimo_v2_flash` | `mimo_v2` | MiMo-V2.6-Flash, mlx-lm's layout (release refused by name); legacy forward deleted; MTP = 3 heads (`mtp_head.zig`); stream packs (`expert_streaming`) stream their `experts.bin` through the same table |
+| `mimo_v2`, `mimo_v2_flash` | `mimo_v2` | MiMo-V2.6-Flash, mlx-lm's layout (release refused by name); legacy forward deleted; MTP = 3 heads (`mtp_head.zig`); stream packs (`expert_streaming`) refused by name |
 | `inkling_mm_model` | `inkling` | NO RoPE (relative-logit bias + short convs); serial, spec off |
-| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, decode and DSpark rounds batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images + EXL3 stream packs |
+| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, decode and DSpark rounds batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images; EXL3 stream packs through a quant plugin's bank; `stream_experts` streams an MLX pack's experts |
 | `bailing_hybrid` | `bailing_hybrid` | Ling 3.0: KDA + MLA hybrid MoE |
-| `glm5_next(_text)`, `glm_moe_dsa` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |
+| `glm5_next(_text)` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |
 | `kev`, `laya`, `d1`, `clef` | same | Typed decisions (`POST /v1/decisions`) |
 | `qwen3_asr` | `qwen3_asr` | `/v1/audio/transcriptions` only, + the forced aligner (`qwen3_forced_aligner`) |
 | `nemotron_diarization` | `nemotron_diarization` | `diarized_json` speakers, run once over the whole clip |
 | `*.gguf` | engines | ds4 / llama.cpp (above); GGUF presence WINS over a stray config.json |
-| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `hunyuan3d`, `trellis2`, `pixal3d`, `idol`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro`, `ming_tts` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
+| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `minimax_h3_image`, `hunyuan3d`, `trellis2`, `pixal3d`, `idol`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro`, `ming_tts` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 
@@ -164,7 +166,7 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 
 - Product skills: `~/.mlx-serve/skills/*.md` (frontmatter trigger substring → body into system prompt; `SkillManager` rescans on mtime).
 - `DownloadManager`: streams to `.partial`, Range resume, 3 retries, cancel preserves partial, size-matching files skipped.
-- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache]`, `[hot-cache]`, `[admission]`, `[providers]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; `pkill -f mlx-serve` between KV-poison tests.
+- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache]`, `[hot-cache]`, `[admission]`, `[providers]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; restart YOUR server between KV-poison tests (never `pkill -f mlx-serve`).
 
 ## Rules
 

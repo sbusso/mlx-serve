@@ -366,7 +366,7 @@ class DownloadManager: ObservableObject {
     nonisolated static func requiredMediaMarker(modelType: String) -> String? {
         switch modelType {
         case "AudioVideo": return "connector.safetensors"
-        case "minimax_h3": return "transformer.safetensors"
+        case "minimax_h3", "minimax_h3_image": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
@@ -982,6 +982,7 @@ class DownloadManager: ObservableObject {
     /// runs after the inner work returns (whether completion, failure, or
     /// cancellation) so the caller can refresh model lists exactly once.
     func start(repoId: String, onFinish: @escaping @MainActor () -> Void) {
+        lastRequest[repoId] = .repo
         activeTasks[repoId]?.cancel()
         let task = Task { @MainActor [weak self] in
             await self?.download(repoId: repoId)
@@ -992,6 +993,23 @@ class DownloadManager: ObservableObject {
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    /// What a repo's last transfer was started for, so Resume or Retry on its row asks for the same files: a
+    /// GGUF repo's quant, an MLX shelf's variant, a bundle's component selection. The whole-repo request finds
+    /// nothing in a shelf.
+    enum TransferRequest { case repo, gguf(GgufQuant), mlxVariant(MlxVariant), bundle(MediaBundle) }
+    private var lastRequest: [String: TransferRequest] = [:]
+
+    /// Start `repoId` again the way it was last started (`lastRequest`); a repo never started here takes the
+    /// whole-repo request.
+    func retry(repoId: String, onFinish: @escaping @MainActor () -> Void) {
+        switch lastRequest[repoId] {
+        case .gguf(let quant): startGguf(repoId: repoId, quant: quant, onFinish: onFinish)
+        case .mlxVariant(let variant): startMlxVariant(repoId: repoId, variant: variant, onFinish: onFinish)
+        case .bundle(let bundle): startBundle(bundle, onFinish: onFinish)
+        case .repo, nil: start(repoId: repoId, onFinish: onFinish)
+        }
     }
 
     // MARK: - Speculation gems (the Model Settings socket)
@@ -1315,7 +1333,10 @@ class DownloadManager: ObservableObject {
     /// disk). `onFinish` runs once after the last component settles. Stops the
     /// bundle if a component fails.
     func startBundle(_ bundle: MediaBundle, onFinish: @escaping @MainActor () -> Void) {
-        for comp in bundle.components { mediaBundleRepos.insert(comp.repo) }
+        for comp in bundle.components {
+            mediaBundleRepos.insert(comp.repo)
+            lastRequest[comp.repo] = .bundle(bundle)
+        }
         activeTasks[bundle.id]?.cancel()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1413,6 +1434,7 @@ class DownloadManager: ObservableObject {
     /// whole-folder wipe would delete them as collateral for cancelling a
     /// second download.
     func startGguf(repoId: String, quant: GgufQuant, onFinish: @escaping @MainActor () -> Void) {
+        lastRequest[repoId] = .gguf(quant)
         activeTasks[repoId]?.cancel()
         // Scope cancellation to this quant up front; the task augments the list
         // with the MTP dependency once it's resolved from the repo tree.
@@ -1475,6 +1497,7 @@ class DownloadManager: ObservableObject {
     /// the generic whole-folder wipe would be aimed at the parent repo, which
     /// holds nothing, leaving the interrupted variant behind.
     func startMlxVariant(repoId: String, variant: MlxVariant, onFinish: @escaping @MainActor () -> Void) {
+        lastRequest[repoId] = .mlxVariant(variant)
         activeTasks[repoId]?.cancel()
         let dest = MlxVariantScan.localRepoId(repoId: repoId, folder: variant.folder)
         activeVariantDest[repoId] = dest
@@ -2209,7 +2232,12 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
+        var seenPaths = Set<String>()
+        let unique = out.filter {
+            seenPaths.insert(URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL.path).inserted
+        }
+
+        return Self.markingInFlight(unique, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
