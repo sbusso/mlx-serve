@@ -21,7 +21,7 @@ model_fits "$MODEL" || { echo "SKIP: $(model_gb "$MODEL") GB > $(max_model_gb) G
 mkdir -p "$HOME/claude-tmp"
 WORK=$(mktemp -d "$HOME/claude-tmp/suppress-cjk.XXXXXX")
 mkdir -p "$WORK/home"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 0.5
+srv_preclean "$PORT"
 HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
     --log-level info --max-concurrent 4 > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
