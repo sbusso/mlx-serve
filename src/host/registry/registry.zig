@@ -1276,6 +1276,19 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// MLX bytes the ready models hold as loaded: each load's own measure (`bytes_live`), its bill where none was
+    /// taken. The bill alone would count a host-mapped table that is not MLX memory.
+    pub fn residentLiveBytes(self: *ModelRegistry, io: std.Io) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var bytes: u64 = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| {
+            if (e.*.state == .ready) bytes += if (e.*.bytes_live != 0) e.*.bytes_live else e.*.bytes_resident;
+        }
+        return bytes;
+    }
+
     fn liveBytesFreed(v: *const LoadedModel) u64 {
         return @max(v.bytes_resident, v.bytes_live) +| mlx_engine.api().hot_cache_bytes(v);
     }

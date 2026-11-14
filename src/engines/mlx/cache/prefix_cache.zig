@@ -716,6 +716,12 @@ pub const HotPrefixCache = struct {
     /// An earlier session's pending snapshot a newer commit displaced before it landed whole;
     /// flushes finish it first, one slice each, so no commit pays for its write.
     finishing_disk: ?PendingDiskFlush = null,
+    /// What every eviction since load was billed, and what the allocator returned for it. They part ways when an
+    /// evicted entry's buffers live on in another holder (a restored slot, an heir's checkpoints, a disk holder).
+    evicted_billed_bytes: u64 = 0,
+    evicted_live_bytes: u64 = 0,
+    /// Checked-out entries the last idle check found (`noteIdle`), so it speaks once per change.
+    idle_checked_out: u32 = 0,
     /// Registered exports that failed or were cancelled, including after metadata submission.
     module_export_losses_total: u64 = 0,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
@@ -3785,8 +3791,21 @@ pub const HotPrefixCache = struct {
         const had_ssm = evicted.ssm_checkpoints != null;
         const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
         const key = evicted.cache_key;
-        self.current_kv_bytes -|= evicted.kv_bytes;
+        const billed = evicted.kv_bytes;
+        self.current_kv_bytes -|= billed;
+        var live_before: usize = 0;
+        _ = mlx.mlx_get_active_memory(&live_before);
+        const parked_before = self.parkedBytes();
         self.releaseModuleEntry(&evicted, cancellation);
+        var live_after: usize = 0;
+        _ = mlx.mlx_get_active_memory(&live_after);
+        const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
+        self.evicted_billed_bytes +|= billed;
+        self.evicted_live_bytes +|= freed_live;
+        log.debug("  [hot-cache] eviction ({s}) returned {d} MB live of {d} MB billed, {d} MB parked for the SSD tier; since load {d} of {d} MB\n", .{
+            reason,                                  freed_live >> 20,                 billed >> 20,
+            (self.parkedBytes() -| parked_before) >> 20, self.evicted_live_bytes >> 20, self.evicted_billed_bytes >> 20,
+        });
         if (had_ssm) {
             log.info("  [hot-cache] evicted LRU entry ({s}; key={x}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
                 reason, key, tokens_len, kv_mb, ssm_mb,
@@ -3816,6 +3835,43 @@ pub const HotPrefixCache = struct {
             bytes +|= m.aux_bytes;
         };
         return bytes;
+    }
+
+    /// KV, checkpoint and spec bytes the two disk holders keep until their SSD flush lands. `residentBytes` bills a
+    /// holder's module state only, so these are in no other figure (they may share buffers with a live slot).
+    pub fn parkedBytes(self: *const HotPrefixCache) u64 {
+        var bytes: u64 = 0;
+        for ([_]*const ?PendingDiskFlush{ &self.finishing_disk, &self.pending_disk }) |holder| {
+            const p = if (holder.*) |*h| h else continue;
+            bytes += snapshotBytes(&p.snapshot);
+            if (p.ssm_cps) |cps| for (cps) |*cp| {
+                bytes += ssmCheckpointBytes(cp);
+            };
+            if (p.dflash) |*d| bytes += specSnapBytes(d);
+            if (p.mtp) |*m| bytes += specSnapBytes(m);
+        }
+        return bytes;
+    }
+
+    pub const CheckedOut = struct { entries: u32 = 0, bytes: u64 = 0 };
+
+    /// Entries a slot took by move: out of reach of every match, eviction and flush until that slot commits or ends.
+    pub fn checkedOut(self: *const HotPrefixCache) CheckedOut {
+        var out: CheckedOut = .{};
+        for (self.entries.items) |*e| if (e.checked_out_by != null) {
+            out.entries += 1;
+            out.bytes += e.kv_bytes;
+        };
+        return out;
+    }
+
+    /// Call when no request is alive. An entry still checked out then has no slot left to commit or drop it and
+    /// stays out of every match, eviction and flush for good; says so once per change in their count.
+    pub fn noteIdle(self: *HotPrefixCache) void {
+        const out = self.checkedOut();
+        if (out.entries == self.idle_checked_out) return;
+        self.idle_checked_out = out.entries;
+        if (out.entries > 0) log.warn("  [hot-cache] {d} entries ({d} MB) are still checked out with no request alive\n", .{ out.entries, out.bytes >> 20 });
     }
 
     /// Additional host/readback scratch before the next module slice, beyond stagedHostBytes.
@@ -8513,6 +8569,89 @@ test "a PROPORTIONATE share still restores, and is still protected" {
     var off2: usize = 0;
     const hit2 = try hc2.lookupAndRestore(&slot2, &off2, null, s, &cold, false, &.{}, null, null);
     try t.expectEqual(@as(usize, 11), hit2.matched);
+}
+
+test "probes: every eviction records its bill and what the allocator returned; a shared entry returns nothing; a checkout is counted" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var toks_a: [4096]u32 = undefined;
+    for (&toks_a, 0..) |*t, i| t.* = @intCast(i + 1);
+    var toks_b: [4096]u32 = undefined;
+    for (&toks_b, 0..) |*t, i| t.* = @intCast(i + 1_000_001);
+    inline for (.{ &toks_a, &toks_b }) |toks| {
+        var cache = try KVCache.init(testing.allocator, 8);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 8, 4096);
+        for (cache.entries) |*e| {
+            if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+            if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        }
+        _ = try hc.commit(&cache, toks, false);
+    }
+    try testing.expectEqual(@as(u64, 0), hc.evicted_billed_bytes);
+
+    // A is exclusive: the commit path's evictor gets its bytes back.
+    hc.evictOneLru("byte budget", null);
+    const billed_a = hc.evicted_billed_bytes;
+    try testing.expect(billed_a > 1 << 20);
+    try testing.expect(hc.evicted_live_bytes * HotPrefixCache.SHARED_RETURN_DIVISOR >= billed_a);
+
+    // B is restored into a live cache first: its eviction is billed in full and returns nothing.
+    var live_b = try KVCache.init(testing.allocator, 8);
+    defer live_b.deinit();
+    var moe_off: usize = 0;
+    try testing.expect((try hc.lookupAndRestore(&live_b, &moe_off, null, s, &toks_b, false, &.{}, null, null)).full_match);
+    const live_a = hc.evicted_live_bytes;
+    hc.evictOneLru("byte budget", null);
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expect(hc.evicted_billed_bytes - billed_a > 1 << 20);
+    try testing.expect((hc.evicted_live_bytes - live_a) * HotPrefixCache.SHARED_RETURN_DIVISOR < hc.evicted_billed_bytes - billed_a);
+
+    // A checkout is counted with its bytes, and an idle check remembers it.
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    var moved = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    moved.ssd_first = true;
+    defer moved.deinit();
+    try testCheckoutCache(&moved, s, &tokens, 4096);
+    try testing.expectEqual(HotPrefixCache.CheckedOut{}, moved.checkedOut());
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var off: usize = 0;
+    _ = try moved.lookupAndRestoreForSlot(&slot, &off, null, s, &prompt, false, &.{}, null, null, 42);
+    try testing.expectEqual(HotPrefixCache.CheckedOut{ .entries = 1, .bytes = moved.entries.items[0].kv_bytes }, moved.checkedOut());
+    moved.noteIdle();
+    try testing.expectEqual(@as(u32, 1), moved.idle_checked_out);
+}
+
+test "probes: a snapshot parked for the SSD tier is counted while it waits and gone once it lands" {
+    const s = mlx.gpuStream();
+    var a_tokens: [1200]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 1200);
+    var probe = try cache.snapshot();
+    const row_bytes = HotPrefixCache.snapshotRowBytes(&probe);
+    probe.deinit();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var hc = try testBoundedSsdFirst(&tmp, &buf, row_bytes);
+    defer hc.deinit();
+    try testing.expectEqual(@as(u64, 0), hc.parkedBytes());
+    _ = try hc.commit(&cache, &a_tokens, false);
+    // The holder keeps the whole live snapshot, and `residentBytes` bills none of it.
+    try testing.expect(hc.pending_disk != null);
+    try testing.expect(hc.parkedBytes() >= row_bytes * 1200);
+    var flushes: usize = 0;
+    while ((hc.pending_disk != null or hc.finishing_disk != null) and flushes < 64) : (flushes += 1) hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(u64, 0), hc.parkedBytes());
 }
 
 test "a 0-token outcome is not a restore: no LRU bump, no protection, and the entry stays evictable" {
